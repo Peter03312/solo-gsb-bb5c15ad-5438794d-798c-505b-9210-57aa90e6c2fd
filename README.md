@@ -10,6 +10,9 @@
 预检前按规范化后的归档路径 glob **筛选实际解包条目**（include/exclude）；
 另有**目标目录覆盖预演**接口：给定目标目录现存清单与按顺序解包的清单，
 在内存中的虚拟目录树上逐条干跑，预判每个条目将是新建、覆盖、目录复用还是被阻挡；
+以及**前缀解包回退预演**接口：在相同干跑规则下只模拟解包清单的前
+`stop_after` 条，给出执行前需备份的现存文件与可把该前缀造成的变化完全还原的
+有序回退步骤（删新建文件、恢复被覆盖文件、由深到浅删除新建目录）；
 以及**目录镜像同步预演**接口：给定现存布局与期望归档布局，只在内存中生成
 把现存布局同步为期望布局的完整操作序列（删除多余/类型互换节点、建目录、写文件）；
 另有**清单核对**接口：给定约定清单与交付清单（条目含相对路径、`file`/`directory`
@@ -186,6 +189,87 @@ curl -s http://localhost:8000/api/v1/overlay-preview \
   -H 'Content-Type: application/json' \
   -d '{"existing":[{"path":"docs/readme.txt","type":"file"}],"incoming":[{"path":"docs/readme.txt","type":"file"},{"path":"docs","type":"file"}]}'
 ```
+
+### `POST /api/v1/rollback-preview`
+
+前缀解包回退预演：请求体与 overlay-preview 一样包含**现存清单**（`existing`）
+与**按顺序解包的清单**（`incoming`），另加整数 `stop_after`（**0 至 incoming
+清单长度**，含端点；越界返回 422）。服务只模拟解包清单的**前 `stop_after`
+条**（前缀），判定规则**完全沿用 overlay-preview**：同样的 Windows 路径规范化、
+现存清单校验（不安全路径/同键重复/文件祖先冲突返回 422）、虚拟目录树与
+CREATE / OVERWRITE / REUSE_DIRECTORY / BLOCKED 规则，成功条目立即入树影响
+后续判定；前缀之后的条目不模拟、不产生任何影响。全程纯内存计算，**不读取
+任何实际文件内容**。
+
+响应在此之外给出两部分结果：
+
+- `backup_files`：**执行该前缀前需要备份的现存文件**。仅当某个现存**文件**
+  将被前缀条目首次覆盖（OVERWRITE）时列出；**同键只列一次**（重复覆盖、
+  大小写/NFC/段尾变体覆盖都算同键），按首次覆盖的 incoming 下标升序。
+  每条含现存清单下标 `existing_index`、解包前规范路径 `canonical_path`、
+  Windows 比较键与 `first_overwrite_index`（首次覆盖条目的 incoming 下标）。
+  目录复用、类型冲突、各类被阻挡条目不产生备份。
+- `rollback_steps`：**可把该前缀造成的变化还原**的有序回退步骤，按下列
+  三个阶段顺序排定、`order` 从 1 开始连续编号：
+
+  1. `DELETE_CREATED_FILE`：前缀**新建的文件删除一次**（同键一次；先新建后
+     又被前缀自身覆盖的文件仍只删一次），按首次新建的 incoming 下标逆序；
+  2. `RESTORE_FILE`：被覆盖的现存文件**从执行前备份恢复一次**，按首次覆盖
+     的 incoming 下标逆序；**重复覆盖同一路径仍以解包前状态为恢复目标**；
+  3. `REMOVE_DIRECTORY`：前缀**新建的目录**（显式 CREATE 的目录与由新条目
+     推导出的**隐含父目录**，现存快照中不存在者）在其子项处理完后**由深到浅
+     删除**，同深度按 Windows 比较键升序，保证先删子节点后删父节点。
+
+  **复用目录**（REUSE_DIRECTORY，无论复用现存显式/隐含目录）与**被阻挡条目**
+  （BLOCKED）不产生任何回退步骤；现存文件/目录/隐含目录均原样保留。
+  步骤的 `source` 标明节点来源：`incoming`（前缀新建，`index` 为 incoming
+  下标）、`existing`（恢复现存文件，`index` 为 existing 下标）、`implicit`
+  （前缀推导出的隐含父目录，`index` 为 `null`）。
+
+请求体示例：
+
+```json
+{
+  "existing": [
+    { "path": "docs/readme.txt", "type": "file" },
+    { "path": "keep.txt", "type": "file" }
+  ],
+  "incoming": [
+    { "path": "docs/readme.txt", "type": "file" },
+    { "path": "new/a/deep.txt", "type": "file" },
+    { "path": "new/b", "type": "directory" },
+    { "path": "new/b/x.txt", "type": "file" },
+    { "path": "docs", "type": "file" },
+    { "path": "keep.txt", "type": "file" }
+  ],
+  "stop_after": 4
+}
+```
+
+上例只模拟前 4 条（第 5、6 条不模拟）：`docs/readme.txt` 被覆盖需先备份，
+`new/a/deep.txt`、`new/b/x.txt` 为新建文件，`new/b` 与隐含目录 `new`、
+`new/a` 为新建目录。返回的回退步骤依次为：删除 `new/b/x.txt` → 删除
+`new/a/deep.txt` → 从备份恢复 `docs/readme.txt` → 删除目录 `new/a` →
+`new/b` → `new`（深 → 浅）。`stop_after: 0` 时不模拟任何条目，
+`backup_files` 与 `rollback_steps` 均为空；`incoming` 可为空，但此时
+`stop_after` 必须为 0。
+
+响应的 `entries` 只包含被模拟的前缀条目，字段与 overlay-preview 完全一致
+（`index` 仍对应完整 incoming 清单的下标，从 1 开始）；`summary` 除
+`total / create / overwrite / reuse_directory / blocked` 前缀计数外，另含
+`backups`（备份文件数）、`rollback_steps`（回退步骤总数）及
+`delete_created_file / restore_file / remove_directory` 三类步骤计数。
+
+curl 示例（服务监听宿主机 **8000** 端口）：
+
+```bash
+curl -s http://localhost:8000/api/v1/rollback-preview \
+  -H 'Content-Type: application/json' \
+  -d '{"existing":[{"path":"docs/readme.txt","type":"file"}],"incoming":[{"path":"docs/readme.txt","type":"file"},{"path":"new.txt","type":"file"}],"stop_after":2}'
+```
+
+上例返回的回退步骤：先删除新建的 `new.txt`，再从备份恢复
+`docs/readme.txt`（无新建目录，故无 `REMOVE_DIRECTORY`）。
 
 ### `POST /api/v1/mirror-preview`
 
@@ -728,15 +812,16 @@ curl -s http://localhost:8000/api/v1/preflight \
 ```
 .
 ├── app/
-│   ├── main.py          # FastAPI 路由（/health、/api/v1/preflight、/api/v1/overlay-preview、/api/v1/mirror-preview、/api/v1/manifest-audit、/api/v1/relocation-preview）
+│   ├── main.py          # FastAPI 路由（/health、/api/v1/preflight、/api/v1/overlay-preview、/api/v1/rollback-preview、/api/v1/mirror-preview、/api/v1/manifest-audit、/api/v1/relocation-preview）
 │   ├── normalize.py     # Windows 路径规范化与 unsafe 判定（纯函数）
-│   ├── schemas.py       # Pydantic 请求/响应模型（含 repair_plan、symlink_analysis、resource_limits、overlay-preview、mirror-preview、manifest-audit、relocation-preview）
-│   ├── service.py       # 碰撞分组、层级冲突、资源预算、符号链接分析、覆盖预演、镜像同步预演、清单核对与重定位预演编排
+│   ├── schemas.py       # Pydantic 请求/响应模型（含 repair_plan、symlink_analysis、resource_limits、overlay-preview、rollback-preview、mirror-preview、manifest-audit、relocation-preview）
+│   ├── service.py       # 碰撞分组、层级冲突、资源预算、符号链接分析、覆盖预演、前缀回退预演、镜像同步预演、清单核对与重定位预演编排
 │   ├── audit.py         # 清单核对：缺失/额外/类型不符/摘要不符/一致、层级阻挡与同键歧义（纯函数）
 │   ├── symlink.py       # 符号链接风险分析：目标越界、链接链循环、路径劫持（纯函数）
 │   ├── resource.py      # 解压资源预算校验：单文件/整批解压大小、整数交叉乘法压缩比（纯函数）
 │   ├── selection.py     # selection_rules glob 匹配（*、? 按段，** 跨多级）与 include/exclude 筛选（纯函数）
 │   ├── overlay.py       # 目标目录覆盖预演：清单校验、虚拟目录树与按序干跑（纯函数）
+│   ├── rollback.py      # 前缀解包回退预演：执行前备份清单与删文件/恢复/深→浅删目录三阶段回退步骤（纯函数）
 │   ├── mirror.py        # 目录镜像同步预演：三阶段操作序列（删除→建目录→写文件，纯函数）
 │   ├── relocation.py    # 路径重定位预演：源前缀→目标前缀改写与结果冲突检测（纯函数）
 │   └── repair.py        # repair=true 确定性改名修复计划（纯函数）

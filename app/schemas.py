@@ -17,6 +17,7 @@ from .overlay import (
     OverlayStatus,
     validate_existing_entries,
 )
+from .rollback import RollbackOperation
 from .selection import SelectionAction, apply_selection_rules, validate_pattern
 
 
@@ -479,6 +480,129 @@ class OverlayPreviewResponse(BaseModel):
     target: str = "windows"
     entries: list[OverlayEntryOut]
     summary: OverlaySummary
+
+
+class RollbackPreviewRequest(BaseModel):
+    """前缀解包回退预演请求：现存清单 + 按顺序解包清单 + 仅模拟前 stop_after 条。"""
+
+    existing: list[OverlayEntryIn] = Field(
+        default_factory=list,
+        description=(
+            "目标目录现存的 file/directory 清单（可为空，表示空目录）；"
+            "沿用 overlay-preview 的现存清单校验，含不安全路径、同键重复或"
+            "文件占据其他条目祖先路径时返回 422"
+        ),
+    )
+    incoming: list[OverlayEntryIn] = Field(
+        default_factory=list,
+        description=(
+            "按顺序解包的 file/directory 清单（可为空，此时 stop_after 必须为 0）；"
+            "与 overlay-preview 相同，不安全条目不返回 422 而在干跑中记为 BLOCKED"
+        ),
+    )
+    stop_after: int = Field(
+        ...,
+        ge=0,
+        description=(
+            "仅模拟解包清单的前 stop_after 条（前缀）；取值范围 0 至 incoming "
+            "清单长度（含端点），越界返回 422"
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _validate_request(self) -> "RollbackPreviewRequest":
+        if self.stop_after > len(self.incoming):
+            raise ValueError(
+                f"stop_after（{self.stop_after}）不得超过 incoming 清单长度"
+                f"（{len(self.incoming)}）"
+            )
+        normalized = [
+            normalize_entry(index=i, entry_type=e.type.value, original_path=e.path)
+            for i, e in enumerate(self.existing, start=1)
+        ]
+        validate_existing_entries(normalized)
+        return self
+
+
+class RollbackBackupFileOut(BaseModel):
+    existing_index: int = Field(
+        ..., description="被覆盖现存文件在 existing 清单中的下标（从 1 开始）"
+    )
+    canonical_path: str = Field(..., description="解包前现存文件的规范路径（正斜杠分隔）")
+    comparison_key: str = Field(..., description="Windows 等价比较键（小写折叠）")
+    first_overwrite_index: int = Field(
+        ..., description="首次覆盖该文件的 incoming 下标（从 1 开始）"
+    )
+
+
+class RollbackStepOut(BaseModel):
+    order: int = Field(..., description="回退执行顺序（从 1 开始）")
+    operation: RollbackOperation = Field(
+        ...,
+        description=(
+            "回退操作：DELETE_CREATED_FILE（删除前缀新建的文件）、"
+            "RESTORE_FILE（被覆盖现存文件从执行前备份恢复）、"
+            "REMOVE_DIRECTORY（删除前缀新建的目录，含隐含父目录）"
+        ),
+    )
+    node_type: OverlayEntryType = Field(..., description="节点类型：file 或 directory")
+    source: OverlayNodeSource = Field(
+        ...,
+        description=(
+            "回退节点来源：incoming（前缀新建条目）、existing（解包前现存文件）"
+            "或 implicit（前缀推导出的隐含父目录）"
+        ),
+    )
+    index: int | None = Field(
+        ...,
+        description=(
+            "相关清单下标（从 1 开始）：RESTORE_FILE 指向 existing，"
+            "DELETE_CREATED_FILE / 显式目录的 REMOVE_DIRECTORY 指向 incoming；"
+            "隐含父目录删除为 null"
+        ),
+    )
+    canonical_path: str = Field(..., description="规范路径（正斜杠分隔）")
+    comparison_key: str = Field(..., description="Windows 等价比较键（小写折叠）")
+
+
+class RollbackSummary(BaseModel):
+    total: int = Field(..., description="实际模拟的前缀条目数（等于 stop_after）")
+    create: int
+    overwrite: int
+    reuse_directory: int
+    blocked: int
+    backups: int = Field(..., description="执行前需备份的现存文件数（同键只计一次）")
+    rollback_steps: int = Field(..., description="有序回退步骤总数")
+    delete_created_file: int = Field(..., description="DELETE_CREATED_FILE 步骤数")
+    restore_file: int = Field(..., description="RESTORE_FILE 步骤数")
+    remove_directory: int = Field(..., description="REMOVE_DIRECTORY 步骤数")
+
+
+class RollbackPreviewResponse(BaseModel):
+    target: str = "windows"
+    stop_after: int = Field(..., description="实际模拟的前缀长度（回显请求值）")
+    entries: list[OverlayEntryOut] = Field(
+        ...,
+        description=(
+            "前缀（前 stop_after 条）的 overlay 干跑判定，字段与 "
+            "overlay-preview 的 entries 相同，严格保持 incoming 输入顺序"
+        ),
+    )
+    backup_files: list[RollbackBackupFileOut] = Field(
+        ...,
+        description=(
+            "执行前需备份的现存文件清单（同键只列一次，按首次覆盖的 incoming "
+            "下标升序）"
+        ),
+    )
+    rollback_steps: list[RollbackStepOut] = Field(
+        ...,
+        description=(
+            "可把该前缀造成的变化还原的有序回退步骤：先删除新建文件，再从"
+            "备份恢复被覆盖现存文件，最后由深到浅删除新建目录（含隐含父目录）"
+        ),
+    )
+    summary: RollbackSummary
 
 
 class MirrorPreviewRequest(BaseModel):
