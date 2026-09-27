@@ -19,6 +19,8 @@ from .schemas import (
     PreflightRequest,
     RelocationPreviewRequest,
     RelocationPreviewResponse,
+    RollbackPreviewRequest,
+    RollbackPreviewResponse,
 )
 from .service import (
     run_manifest_audit,
@@ -26,6 +28,7 @@ from .service import (
     run_overlay_preview,
     run_preflight,
     run_relocation_preview,
+    run_rollback_preview,
 )
 
 app = FastAPI(
@@ -42,10 +45,14 @@ app = FastAPI(
         "清单核对（约定清单 vs 交付清单：缺失、额外、类型不符、摘要不符、"
         "一致、层级阻挡与同键歧义，仅比较声明 SHA-256）；路径重定位预演"
         "（按源前缀→目标前缀规则改写条目路径，最长源前缀优先、同长度取最后一条，"
-        "并预检结果中的同键重复与文件祖先冲突）。"
+        "并预检结果中的同键重复与文件祖先冲突）；"
+        "前缀解包回退预演（仅模拟解包清单前 stop_after 条，沿用覆盖预演的"
+        "阻挡/覆盖规则，生成执行前需备份的现存文件路径与把该前缀变化还原的"
+        "有序回退步骤：删除新建文件、从备份恢复被覆盖文件、由深到浅删除新建"
+        "及隐含父目录）。"
         "纯内存计算，不访问文件系统。"
     ),
-    version="1.7.0",
+    version="1.8.0",
 )
 
 
@@ -65,6 +72,7 @@ def root() -> dict[str, str]:
         "mirror_preview": "POST /api/v1/mirror-preview",
         "manifest_audit": "POST /api/v1/manifest-audit",
         "relocation_preview": "POST /api/v1/relocation-preview",
+        "rollback_preview": "POST /api/v1/rollback-preview",
     }
 
 
@@ -97,6 +105,16 @@ def overlay_preview(request: OverlayPreviewRequest) -> OverlayPreviewResponse:
 )
 def mirror_preview(request: MirrorPreviewRequest) -> MirrorPreviewResponse:
     return run_mirror_preview(request)
+
+
+@app.post(
+    "/api/v1/rollback-preview",
+    response_model=RollbackPreviewResponse,
+    tags=["overlay"],
+    summary="前缀解包回退预演：仅模拟前 stop_after 条，生成执行前备份路径与有序回退步骤（纯内存）",
+)
+def rollback_preview(request: RollbackPreviewRequest) -> RollbackPreviewResponse:
+    return run_rollback_preview(request)
 
 
 @app.post(

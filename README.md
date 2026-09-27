@@ -18,7 +18,10 @@
 以及**路径重定位预演**接口：给定 `file`/`directory` 条目与按顺序排列的
 源前缀→目标前缀规则，按规范化路径段的比较键做前缀匹配改写路径
 （最长源前缀优先、同长度取最后一条，未命中保留原路径），并预检重定位结果中的
-同键重复与文件占据祖先路径冲突，逐条给出可用状态。
+同键重复与文件占据祖先路径冲突，逐条给出可用状态；
+另有**前缀解包回退预演**接口：给定现存清单、按顺序解包清单与 `stop_after`，
+仅模拟前 `stop_after` 条解包，沿用覆盖预演的全部阻挡/覆盖规则，输出执行前需
+备份的现存文件路径，以及可把该前缀造成的变化还原的有序回退步骤。
 
 > 服务**只对路径字符串做词法分析，全程不访问文件系统**，不会读取或写入任何条目。
 
@@ -438,6 +441,99 @@ curl -s http://localhost:8000/api/v1/relocation-preview \
 上例中 `old/docs/a.txt` 命中规则被改写为 `new/home/a.txt`
 （`matched_rule_index` 为 0），`keep.txt` 未命中保留原路径，两条均可用。
 
+### `POST /api/v1/rollback-preview`
+
+前缀解包回退预演：给定目标目录**现存清单**（`existing`）、**按顺序解包清单**
+（`incoming`）与 `stop_after`，**仅模拟前 `stop_after` 条解包**，沿用
+overlay-preview 的 Windows 路径规范化、现存清单校验与 overlay 的
+阻挡/覆盖规则（不安全路径、文件祖先阻挡、同键类型冲突、文件覆盖、目录复用；
+成功条目立即进入虚拟目录树并影响后续判定），输出：
+
+1. **执行前需备份的现存文件路径**（`backup_paths`）：前缀会覆盖到的、解包前
+   已存在的文件规范路径，**同键只列一次**，按首次被覆盖的解包顺序排列；
+2. **有序回退步骤**（`steps`）：按顺序执行即可把该前缀造成的变化**还原为
+   解包前状态**。
+
+全程纯内存词法计算，不访问文件系统，**不读取实际文件内容**——恢复目标始终是
+解包前的现存状态（由清单词法推导），而非读取任何备份或磁盘文件。
+
+请求体：
+
+```json
+{
+  "existing": [
+    { "path": "docs/readme.txt", "type": "file" },
+    { "path": "assets", "type": "directory" }
+  ],
+  "incoming": [
+    { "path": "docs/readme.txt", "type": "file" },
+    { "path": "assets/logo.png", "type": "file" },
+    { "path": "new/deep/file.bin", "type": "file" },
+    { "path": "docs/readme.txt", "type": "file" },
+    { "path": "../escape.sh", "type": "file" }
+  ],
+  "stop_after": 4
+}
+```
+
+- `existing` / `incoming`：与 overlay-preview 完全一致（`existing` 可省略或为
+  空；`incoming` 至少 1 条；`existing` 含不安全路径、同键重复或文件占据其他
+  条目祖先路径时整个请求返回 422）。
+- `stop_after`：**整数，取值 `0` 至 `incoming` 清单长度（含两端）**，表示只
+  模拟解包顺序上的前 `stop_after` 条；为 `0` 时不模拟任何条目
+  （`entries`、`backup_paths`、`steps` 均为空）；越界（负数或大于清单长度）
+  返回 422。`stop_after` 之后的条目不模拟、对虚拟树无任何影响。
+
+回退步骤分三个阶段（`steps[].order` 从 1 开始连续编号）：
+
+| operation | 含义 |
+| --- | --- |
+| `DELETE_FILE` | 前缀**新建**的文件删除一次。同一路径在前缀内被后续条目重复覆盖，仍是同一个前缀新建文件，只删除一次 |
+| `RESTORE_FILE` | 被覆盖的**解包前现存文件**从备份恢复一次。同一路径被重复覆盖时，恢复目标恒为**解包前状态**，故同键只恢复一次（与 `backup_paths` 一一对应） |
+| `DELETE_DIRECTORY` | 前缀**新建目录**及其**推导的隐含父目录**，在子项处理完后由**深到浅**删除（同深度按 Windows 比较键排序） |
+
+回退含义的其余要点：
+
+- **`REUSE_DIRECTORY`（复用目录）与 `BLOCKED`（被阻挡）条目不产生变化，故不
+  产生任何回退步骤**；被阻挡条目也不会推导隐含父目录。
+- **解包前已存在的目录（含现存清单推导出的隐含目录）一律保留**：即使被前缀
+  条目以 `REUSE_DIRECTORY` 复用，也不在删除之列。仅当前缀条目首次把目录键
+  带入虚拟树（新建文件推导的父目录、新建目录本身）时才需要删除。
+- 阶段顺序保证安全：先删新建文件（清空新建目录内容），再恢复现存文件，最后
+  由深到浅删除空的新建目录；被恢复的现存文件所在的解包前目录均保留，不会被
+  删除。
+- 回退步骤中的 `canonical_path`：`RESTORE_FILE` 取**解包前现存清单**的展示
+  形态（如现存为 `Docs\\ReadMe.txt`，恢复路径即 `Docs/ReadMe.txt`）；
+  `DELETE_FILE` / 新建目录取解包条目的规范路径；`DELETE_DIRECTORY` 的
+  `source` 为 `incoming`（显式新建目录）或 `implicit`（解包推导的父目录），
+  `index` 分别指向 incoming 下标或为 `null`。
+
+响应字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `entries` | 前 `stop_after` 条的模拟判定（结构与 overlay-preview 的 `entries` 完全一致，按下发顺序），含 `CREATE` / `OVERWRITE` / `REUSE_DIRECTORY` / `BLOCKED` 状态与阻挡明细 |
+| `backup_paths` | 执行前需备份的现存文件规范路径（同键只列一次，按首次覆盖顺序） |
+| `steps` | 有序回退步骤，每条含 `order`、`operation`、`node_type`、`source`、`index`、`canonical_path`、`comparison_key` |
+| `summary` | `create / overwrite / reuse_directory / blocked` 为**前缀内**计数；`simulated` 为实际模拟条数（等于 `stop_after`）；`backup_files` 备份数、`delete_files` / `restore_files` / `delete_directories` 各类回退步骤数 |
+
+上例（`stop_after` = 4，最后一条不安全条目不模拟）返回的回退步骤（节选）：
+备份 `docs/readme.txt`（#1 与 #4 重复覆盖，只备份一次）；删除新建文件
+`assets/logo.png`、`new/deep/file.bin`；从备份恢复 `docs/readme.txt`；
+再由深到浅删除隐含新目录 `new/deep`、`new`（`assets` 为解包前已有，保留）。
+
+curl 示例（服务监听宿主机 **8000** 端口）：
+
+```bash
+curl -s http://localhost:8000/api/v1/rollback-preview \
+  -H 'Content-Type: application/json' \
+  -d '{"existing":[{"path":"docs/readme.txt","type":"file"}],"incoming":[{"path":"docs/readme.txt","type":"file"},{"path":"docs/new.txt","type":"file"}],"stop_after":2}'
+```
+
+上例中前缀覆盖了现存 `docs/readme.txt`、新建了 `docs/new.txt`：回退为先删除
+`docs/new.txt`，再从备份恢复 `docs/readme.txt`；隐含目录 `docs` 解包前已
+存在，不删除（`backup_paths` 为 `["docs/readme.txt"]`）。
+
 ## 规范化规则（Windows 目标）
 
 1. **统一分隔符**：`\` 与 `/` 均视为路径分隔符，输出统一为 `/`。
@@ -728,16 +824,17 @@ curl -s http://localhost:8000/api/v1/preflight \
 ```
 .
 ├── app/
-│   ├── main.py          # FastAPI 路由（/health、/api/v1/preflight、/api/v1/overlay-preview、/api/v1/mirror-preview、/api/v1/manifest-audit、/api/v1/relocation-preview）
+│   ├── main.py          # FastAPI 路由（/health、/api/v1/preflight、/api/v1/overlay-preview、/api/v1/mirror-preview、/api/v1/manifest-audit、/api/v1/relocation-preview、/api/v1/rollback-preview）
 │   ├── normalize.py     # Windows 路径规范化与 unsafe 判定（纯函数）
-│   ├── schemas.py       # Pydantic 请求/响应模型（含 repair_plan、symlink_analysis、resource_limits、overlay-preview、mirror-preview、manifest-audit、relocation-preview）
-│   ├── service.py       # 碰撞分组、层级冲突、资源预算、符号链接分析、覆盖预演、镜像同步预演、清单核对与重定位预演编排
+│   ├── schemas.py       # Pydantic 请求/响应模型（含 repair_plan、symlink_analysis、resource_limits、overlay-preview、mirror-preview、manifest-audit、relocation-preview、rollback-preview）
+│   ├── service.py       # 碰撞分组、层级冲突、资源预算、符号链接分析、覆盖预演、镜像同步预演、清单核对、重定位与前缀回退预演编排
 │   ├── audit.py         # 清单核对：缺失/额外/类型不符/摘要不符/一致、层级阻挡与同键歧义（纯函数）
 │   ├── symlink.py       # 符号链接风险分析：目标越界、链接链循环、路径劫持（纯函数）
 │   ├── resource.py      # 解压资源预算校验：单文件/整批解压大小、整数交叉乘法压缩比（纯函数）
 │   ├── selection.py     # selection_rules glob 匹配（*、? 按段，** 跨多级）与 include/exclude 筛选（纯函数）
 │   ├── overlay.py       # 目标目录覆盖预演：清单校验、虚拟目录树与按序干跑（纯函数）
 │   ├── mirror.py        # 目录镜像同步预演：三阶段操作序列（删除→建目录→写文件，纯函数）
+│   ├── rollback.py      # 前缀解包回退预演：备份路径与三阶段有序回退步骤（删除新建文件→恢复覆盖文件→深→浅删新建目录，纯函数）
 │   ├── relocation.py    # 路径重定位预演：源前缀→目标前缀改写与结果冲突检测（纯函数）
 │   └── repair.py        # repair=true 确定性改名修复计划（纯函数）
 ├── tests/               # pytest 用例

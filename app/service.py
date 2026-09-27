@@ -12,6 +12,7 @@ from .relocation import (
     relocate_entries,
 )
 from .overlay import (
+    OverlayDecision,
     OverlayNodeSource,
     OverlayStatus,
     apply_entry,
@@ -20,6 +21,7 @@ from .overlay import (
 )
 from .repair import build_repair_plan
 from .resource import DeclaredSizes, check_resource_budgets
+from .rollback import RollbackOperation, plan_rollback_prefix
 from .schemas import (
     CollisionGroup,
     CollisionMember,
@@ -53,6 +55,10 @@ from .schemas import (
     RelocationPreviewRequest,
     RelocationPreviewResponse,
     RelocationSummary,
+    RollbackPreviewRequest,
+    RollbackPreviewResponse,
+    RollbackStepOut,
+    RollbackSummary,
     Summary,
 )
 from .selection import apply_selection_rules
@@ -335,6 +341,40 @@ def run_preflight(request: PreflightRequest) -> PreflightResponse:
     )
 
 
+def _overlay_entry_out(
+    index: int, normalized: NormalizedEntry, decision: OverlayDecision
+) -> OverlayEntryOut:
+    """把单条覆盖干跑判定结果转换为响应条目。"""
+    blocker = None
+    if decision.blocker is not None:
+        blocker = OverlayBlocker(
+            source=decision.blocker.source,
+            index=decision.blocker.index,
+            canonical_path=decision.blocker.canonical_path,
+        )
+    return OverlayEntryOut(
+        index=index,
+        type=OverlayEntryType(normalized.entry_type),
+        original_path=normalized.original_path,
+        canonical_path=normalized.canonical_path,
+        comparison_key=normalized.comparison_key,
+        safe=not normalized.unsafe,
+        status=decision.status,
+        blocked_reason=decision.reason,
+        blocked_by=blocker,
+        issues=[
+            {
+                "code": issue.code,
+                "severity": issue.severity,
+                "message": issue.message,
+                "segment": issue.segment,
+                "related_index": issue.related_index,
+            }
+            for issue in normalized.issues
+        ],
+    )
+
+
 def run_overlay_preview(request: OverlayPreviewRequest) -> OverlayPreviewResponse:
     """目标目录覆盖预演：现存清单建树后按序干跑解包清单（纯内存）。
 
@@ -356,37 +396,7 @@ def run_overlay_preview(request: OverlayPreviewRequest) -> OverlayPreviewRespons
         )
         decision = apply_entry(tree, normalized)
         counts[decision.status] += 1
-
-        blocker = None
-        if decision.blocker is not None:
-            blocker = OverlayBlocker(
-                source=decision.blocker.source,
-                index=decision.blocker.index,
-                canonical_path=decision.blocker.canonical_path,
-            )
-        entries_out.append(
-            OverlayEntryOut(
-                index=i,
-                type=OverlayEntryType(normalized.entry_type),
-                original_path=normalized.original_path,
-                canonical_path=normalized.canonical_path,
-                comparison_key=normalized.comparison_key,
-                safe=not normalized.unsafe,
-                status=decision.status,
-                blocked_reason=decision.reason,
-                blocked_by=blocker,
-                issues=[
-                    {
-                        "code": issue.code,
-                        "severity": issue.severity,
-                        "message": issue.message,
-                        "segment": issue.segment,
-                        "related_index": issue.related_index,
-                    }
-                    for issue in normalized.issues
-                ],
-            )
-        )
+        entries_out.append(_overlay_entry_out(i, normalized, decision))
 
     summary = OverlaySummary(
         total=len(entries_out),
@@ -397,6 +407,69 @@ def run_overlay_preview(request: OverlayPreviewRequest) -> OverlayPreviewRespons
     )
     return OverlayPreviewResponse(
         target="windows", entries=entries_out, summary=summary
+    )
+
+
+def run_rollback_preview(request: RollbackPreviewRequest) -> RollbackPreviewResponse:
+    """前缀解包回退预演：仅干跑前 stop_after 条并生成备份路径与回退步骤。
+
+    现存清单校验与阻挡/覆盖规则完全沿用 overlay-preview；回退步骤把该前缀
+    造成的变化还原为解包前状态（纯内存，不读取实际文件内容）。
+    """
+    existing = [
+        normalize_entry(index=i, entry_type=e.type.value, original_path=e.path)
+        for i, e in enumerate(request.existing, start=1)
+    ]
+    incoming = [
+        normalize_entry(index=i, entry_type=e.type.value, original_path=e.path)
+        for i, e in enumerate(request.incoming, start=1)
+    ]
+
+    plan = plan_rollback_prefix(existing, incoming, request.stop_after)
+
+    entries_out = [
+        _overlay_entry_out(normalized.index, normalized, decision)
+        for normalized, decision in plan.decisions
+    ]
+
+    counts = {status: 0 for status in OverlayStatus}
+    for _normalized, decision in plan.decisions:
+        counts[decision.status] += 1
+    step_counts = {operation: 0 for operation in RollbackOperation}
+    for step in plan.steps:
+        step_counts[step.operation] += 1
+
+    steps_out = [
+        RollbackStepOut(
+            order=step.order,
+            operation=step.operation,
+            node_type=OverlayEntryType(step.node_type),
+            source=step.source,
+            index=step.index,
+            canonical_path=step.canonical_path,
+            comparison_key=step.comparison_key,
+        )
+        for step in plan.steps
+    ]
+
+    summary = RollbackSummary(
+        total=len(entries_out),
+        create=counts[OverlayStatus.CREATE],
+        overwrite=counts[OverlayStatus.OVERWRITE],
+        reuse_directory=counts[OverlayStatus.REUSE_DIRECTORY],
+        blocked=counts[OverlayStatus.BLOCKED],
+        simulated=request.stop_after,
+        backup_files=len(plan.backup_paths),
+        delete_files=step_counts[RollbackOperation.DELETE_FILE],
+        restore_files=step_counts[RollbackOperation.RESTORE_FILE],
+        delete_directories=step_counts[RollbackOperation.DELETE_DIRECTORY],
+    )
+    return RollbackPreviewResponse(
+        target="windows",
+        entries=entries_out,
+        backup_paths=plan.backup_paths,
+        steps=steps_out,
+        summary=summary,
     )
 
 

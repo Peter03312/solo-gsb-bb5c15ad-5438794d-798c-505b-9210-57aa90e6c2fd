@@ -11,6 +11,7 @@ from .normalize import IssueCode, IssueSeverity, normalize_entry
 from .mirror import MirrorOperation
 from .audit import AuditStatus, ManifestSide
 from .relocation import RelocationConflictType
+from .rollback import RollbackOperation
 from .overlay import (
     OverlayBlockReason,
     OverlayNodeSource,
@@ -562,6 +563,97 @@ class MirrorPreviewResponse(BaseModel):
     target: str = "windows"
     steps: list[MirrorStepOut]
     summary: MirrorSummary
+
+
+# ---------------------------------------------------------------------------
+# rollback-preview：前缀解包回退预演
+# ---------------------------------------------------------------------------
+
+
+class RollbackPreviewRequest(OverlayPreviewRequest):
+    """前缀解包回退预演请求：现存清单 + 按顺序解包清单 + 前缀长度（纯内存）。"""
+
+    stop_after: int = Field(
+        ...,
+        ge=0,
+        description=(
+            "仅模拟解包清单的前 stop_after 条（取值 0 至 incoming 长度，"
+            "含两端）；0 表示不模拟任何条目"
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _validate_stop_after(self) -> "RollbackPreviewRequest":
+        if self.stop_after > len(self.incoming):
+            raise ValueError(
+                f"stop_after（{self.stop_after}）不得大于 incoming 清单长度"
+                f"（{len(self.incoming)}）"
+            )
+        return self
+
+
+class RollbackStepOut(BaseModel):
+    order: int = Field(..., description="回退执行顺序（从 1 开始）")
+    operation: RollbackOperation = Field(
+        ...,
+        description=(
+            "回退操作：DELETE_FILE（删除前缀新建文件）、"
+            "RESTORE_FILE（从备份恢复被覆盖的解包前现存文件）、"
+            "DELETE_DIRECTORY（删除前缀新建及推导的隐含父目录）"
+        ),
+    )
+    node_type: OverlayEntryType = Field(..., description="节点类型：file 或 directory")
+    source: OverlayNodeSource = Field(
+        ...,
+        description=(
+            "节点来源：incoming（前缀新建条目）、existing（被覆盖的现存文件）"
+            "或 implicit（解包推导的隐含父目录）"
+        ),
+    )
+    index: int | None = Field(
+        ...,
+        description=(
+            "原清单下标（从 1 开始）：DELETE_FILE 指向 incoming，"
+            "RESTORE_FILE 指向 existing，DELETE_DIRECTORY 中显式目录指向 "
+            "incoming、隐含目录为 null"
+        ),
+    )
+    canonical_path: str = Field(..., description="规范路径（正斜杠分隔，恢复路径取解包前形态）")
+    comparison_key: str = Field(..., description="Windows 等价比较键（casefold 折叠）")
+
+
+class RollbackSummary(OverlaySummary):
+    simulated: int = Field(
+        ..., description="实际模拟的条目数（等于请求的 stop_after）"
+    )
+    backup_files: int = Field(..., description="执行前需备份的现存文件数（同键只计一次）")
+    delete_files: int = Field(..., description="回退步骤中 DELETE_FILE 的数量")
+    restore_files: int = Field(..., description="回退步骤中 RESTORE_FILE 的数量")
+    delete_directories: int = Field(
+        ..., description="回退步骤中 DELETE_DIRECTORY 的数量"
+    )
+
+
+class RollbackPreviewResponse(BaseModel):
+    target: str = "windows"
+    entries: list[OverlayEntryOut] = Field(
+        ..., description="前 stop_after 条模拟结果（与 overlay-preview 的条目结构一致，按下发顺序）"
+    )
+    backup_paths: list[str] = Field(
+        ...,
+        description=(
+            "执行前需备份的解包前现存文件规范路径（同键只列一次，"
+            "按首次被覆盖的解包顺序排列）"
+        ),
+    )
+    steps: list[RollbackStepOut] = Field(
+        ...,
+        description=(
+            "有序回退步骤：先删除新建文件，再从备份恢复被覆盖的现存文件，"
+            "最后由深到浅删除新建及隐含父目录"
+        ),
+    )
+    summary: RollbackSummary
 
 
 class HealthResponse(BaseModel):
